@@ -1,0 +1,5 @@
+comment = 'turbovec-backed vector search for Postgres (Path C proof of concept)'
+default_version = '0.1.0'
+module_pathname = '$libdir/turbovec_pg'
+relocatable = false
+superuser = false

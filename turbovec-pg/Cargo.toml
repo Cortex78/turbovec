@@ -1,0 +1,43 @@
+[package]
+name = "turbovec-pg"
+version = "0.1.0"
+edition = "2021"
+description = "Postgres extension (pgrx) exposing a turbovec-backed vector index — Path C proof of concept"
+license = "MIT"
+publish = false
+
+# This crate is built with `cargo pgrx`, not plain `cargo`. It is excluded
+# from the repo workspace (see the root Cargo.toml) because it pulls the
+# heavy pgrx/bindgen tree and links against a specific Postgres version. All
+# of the logic that does NOT need Postgres lives in `turbovec-pg-engine`,
+# which IS in the workspace and is unit-tested with plain `cargo test`.
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = ["pg17"]
+pg13 = ["pgrx/pg13", "pgrx-tests/pg13"]
+pg14 = ["pgrx/pg14", "pgrx-tests/pg14"]
+pg15 = ["pgrx/pg15", "pgrx-tests/pg15"]
+pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
+pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
+# Enables the in-database `#[pg_test]` suite (run via `cargo pgrx test`).
+pg_test = []
+
+[dependencies]
+# Pin to an exact pgrx release; bump together with pgrx-tests below.
+pgrx = "=0.12.9"
+turbovec-pg-engine = { path = "../turbovec-pg-engine" }
+
+[dev-dependencies]
+pgrx-tests = "=0.12.9"
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "thin"
+codegen-units = 1

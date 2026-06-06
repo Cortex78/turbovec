@@ -1,9 +1,13 @@
 [workspace]
-members = ["turbovec", "turbovec-python"]
-# Standalone smoke test crate that lives outside the workspace on purpose —
-# it must mimic a real downstream `cargo add turbovec` user (no inherited
-# workspace settings, no shared lockfile).
-exclude = ["examples/downstream-smoke"]
+members = ["turbovec", "turbovec-python", "turbovec-pg-engine"]
+# Standalone crates that live outside the workspace on purpose:
+# * examples/downstream-smoke must mimic a real downstream `cargo add
+#   turbovec` user (no inherited workspace settings, no shared lockfile).
+# * turbovec-pg is the pgrx Postgres extension shim — it is built with
+#   `cargo pgrx` against a specific Postgres version and pulls the heavy
+#   pgrx/bindgen dependency tree, so it is kept out of the default build.
+#   Its pure engine logic lives in the in-workspace `turbovec-pg-engine`.
+exclude = ["examples/downstream-smoke", "turbovec-pg"]
 resolver = "2"
 
 [profile.release]

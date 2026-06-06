@@ -1,0 +1,17 @@
+[package]
+name = "turbovec-pg-engine"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Segment-based build/lifecycle engine + ctid<->u64 mapping for a turbovec-backed Postgres index (proof of concept)"
+license = "MIT"
+publish = false
+
+# Pure Rust. Depends only on the turbovec core crate (no pgrx, no Postgres),
+# so the segment engine and ctid mapping can be unit-tested with plain
+# `cargo test`. The Postgres FFI shim lives in the separate `turbovec-pg`
+# crate, which wraps this engine.
+[dependencies]
+turbovec = { path = "../turbovec" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
