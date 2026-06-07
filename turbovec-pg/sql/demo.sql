@@ -41,20 +41,19 @@ FROM q, turbovec_search('docs_idx', (SELECT v FROM q), 10) AS h
 JOIN docs d ON d.ctid = h.ctid
 ORDER BY h.score DESC;
 
--- ── Hybrid / RAG-style filtering ──────────────────────────────────────────────
--- Today: over-fetch from turbovec, then filter/join in SQL.
-WITH hits AS (
-    SELECT * FROM turbovec_search('docs_idx', (SELECT embedding FROM docs WHERE id = 1), 50)
-)
+-- ── Hybrid / RAG-style filtering (kernel-level allowlist) ─────────────────────
+-- A SQL predicate (tenant / ACL / time window / full-text) produces the
+-- candidate ctids; turbovec ranks ONLY within them and skips whole segments
+-- that own none of the allowed tuples — no over-fetch, no post-filter.
 SELECT d.id, d.title, h.score
-FROM hits h
+FROM turbovec_search_filtered(
+        'docs_idx',
+        (SELECT embedding FROM docs WHERE id = 1),
+        10,
+        ARRAY(SELECT ctid FROM docs WHERE title ILIKE '%postgres%')   -- candidate set
+     ) h
 JOIN docs d ON d.ctid = h.ctid
-WHERE d.title ILIKE '%postgres%'     -- arbitrary SQL predicate / tenant / ACL
-ORDER BY h.score DESC
-LIMIT 10;
--- (A follow-up can push an allowlist INTO the kernel via the engine's
---  IdMapIndex.search_with_allowlist so selective filters skip SIMD work
---  instead of over-fetching — see ../README.md "Roadmap".)
+ORDER BY h.score DESC;
 
 -- ── Deletes & persistence ─────────────────────────────────────────────────────
 SELECT turbovec_delete('docs_idx', ctid) FROM docs WHERE id = 1;

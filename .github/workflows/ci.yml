@@ -32,6 +32,12 @@ jobs:
       - name: turbovec test suite
         run: cargo test -p turbovec --release
 
+      # Segment-build + ctid-mapping engine behind the turbovec-pg Postgres
+      # extension PoC. Pure Rust (no Postgres), so it runs in the normal
+      # matrix; the pgrx shim itself is built separately with `cargo pgrx`.
+      - name: turbovec-pg-engine test suite
+        run: cargo test -p turbovec-pg-engine --release
+
       # Standalone cargo project that path-deps turbovec — exercises the same
       # link path a downstream `cargo add turbovec` user hits. Catches BLAS
       # link-propagation regressions of the class fixed in #69.

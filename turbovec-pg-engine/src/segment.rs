@@ -224,6 +224,75 @@ impl SegmentedIndex {
         merged
     }
 
+    /// Top-`k` nearest ids restricted to the `allowed` external ids — the
+    /// hybrid-retrieval path (a SQL `WHERE` / tenant / ACL stage produces the
+    /// candidate set, turbovec ranks within it).
+    ///
+    /// The allowlist is partitioned by owning segment and pushed into each
+    /// segment's `IdMapIndex::search_with_allowlist`, where turbovec's kernel
+    /// filters at 32-vector block granularity. A segment that owns none of the
+    /// allowed ids is skipped entirely, so the cost scales with how selective
+    /// the filter is, not with corpus size.
+    ///
+    /// Ids in `allowed` that are not currently present (deleted, or never
+    /// inserted) are ignored rather than rejected — unlike
+    /// `IdMapIndex::search_with_allowlist`, which panics on an unknown id.
+    ///
+    /// # Panics
+    /// Panics if `query.len() != dim`.
+    pub fn search_with_allowlist(
+        &self,
+        query: &[f32],
+        k: usize,
+        allowed: &[u64],
+    ) -> Vec<(u64, f32)> {
+        assert_eq!(
+            query.len(),
+            self.dim,
+            "query length {} does not match index dim {}",
+            query.len(),
+            self.dim,
+        );
+        if k == 0 {
+            return Vec::new();
+        }
+
+        // Partition allowed ids by owning segment, de-duplicating as we go.
+        // Unknown / deleted ids fall through the `None` arm and are dropped.
+        let mut per_sealed: Vec<Vec<u64>> = vec![Vec::new(); self.sealed.len()];
+        let mut per_hot: Vec<u64> = Vec::new();
+        let mut seen = HashSet::with_capacity(allowed.len());
+        for &id in allowed {
+            if !seen.insert(id) {
+                continue;
+            }
+            match self.owner.get(&id) {
+                Some(Owner::Sealed(s)) => per_sealed[*s].push(id),
+                Some(Owner::Hot) => per_hot.push(id),
+                None => {}
+            }
+        }
+
+        let mut merged: Vec<(u64, f32)> = Vec::new();
+        for (s, ids) in per_sealed.iter().enumerate() {
+            if ids.is_empty() {
+                continue; // no allowed ids here — skip the whole segment
+            }
+            let (scores, rids) = self.sealed[s].search_with_allowlist(query, k, Some(ids));
+            merged.extend(rids.into_iter().zip(scores));
+        }
+        if !per_hot.is_empty() {
+            let (scores, rids) = self.hot.search_with_allowlist(query, k, Some(&per_hot));
+            merged.extend(rids.into_iter().zip(scores));
+        }
+
+        merged.sort_unstable_by(|a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        merged.truncate(k);
+        merged
+    }
+
     /// Number of live vectors across all segments.
     pub fn len(&self) -> usize {
         self.owner.len()
@@ -556,5 +625,75 @@ mod tests {
         let idx = SegmentedIndex::new(64, 4, 16).unwrap();
         assert!(idx.is_empty());
         assert!(idx.search(&vec![0.1f32; 64], 5).is_empty());
+    }
+
+    #[test]
+    fn allowlist_matches_monolithic() {
+        // Filtered search across segments must equal a monolithic
+        // IdMapIndex's filtered search. Same identity-calibration argument as
+        // the unfiltered equivalence test, so results are bit-identical.
+        let dim = 64;
+        let n = 300;
+        let vecs = gen(n, dim, 314);
+        let ids: Vec<u64> = (0..n as u64).collect();
+
+        let mut seg = SegmentedIndex::new(dim, 4, 50).unwrap();
+        for chunk_start in (0..n).step_by(40) {
+            let end = (chunk_start + 40).min(n);
+            seg.add(&vecs[chunk_start * dim..end * dim], &ids[chunk_start..end])
+                .unwrap();
+        }
+        assert!(seg.n_sealed() >= 2);
+
+        let mut mono = IdMapIndex::new(dim, 4).unwrap();
+        mono.add_with_ids(&vecs, &ids).unwrap();
+
+        // Allowlist: every 3rd id (spans every segment), comfortably > k.
+        let allow: Vec<u64> = ids.iter().copied().step_by(3).collect();
+        let allow_set: HashSet<u64> = allow.iter().copied().collect();
+        let k = 10;
+        let queries = gen(12, dim, 271);
+        for q in 0..12 {
+            let query = &queries[q * dim..(q + 1) * dim];
+            let s = seg.search_with_allowlist(query, k, &allow);
+            let (mscores, mids) = mono.search_with_allowlist(query, k, Some(&allow));
+
+            assert_eq!(s.len(), k, "query {q}: expected k filtered results");
+            assert_eq!(s[0].0, mids[0], "query {q}: filtered top-1 differs");
+            assert!((s[0].1 - mscores[0]).abs() < 1e-4);
+            let s_set: HashSet<u64> = s.iter().map(|(id, _)| *id).collect();
+            let m_set: HashSet<u64> = mids.iter().copied().collect();
+            assert_eq!(s_set, m_set, "query {q}: filtered top-k set differs");
+            // Every returned id must be in the allowlist.
+            assert!(s.iter().all(|(id, _)| allow_set.contains(id)));
+        }
+    }
+
+    #[test]
+    fn allowlist_restricts_and_ignores_unknown_ids() {
+        let dim = 64;
+        let n = 120;
+        let vecs = gen(n, dim, 88);
+        let ids: Vec<u64> = (0..n as u64).collect();
+        let mut seg = SegmentedIndex::new(dim, 4, 32).unwrap();
+        for chunk_start in (0..n).step_by(25) {
+            let end = (chunk_start + 25).min(n);
+            seg.add(&vecs[chunk_start * dim..end * dim], &ids[chunk_start..end])
+                .unwrap();
+        }
+        // Delete id 7, then include it (and an id that never existed) in the
+        // allowlist alongside live ids spread across segments.
+        seg.remove(7);
+        let allow = vec![3u64, 7 /* deleted */, 50, 999_999 /* never existed */, 88];
+
+        let res = seg.search_with_allowlist(&vecs[3 * dim..4 * dim], 10, &allow);
+        let got: HashSet<u64> = res.iter().map(|(id, _)| *id).collect();
+
+        // Only live, known allowlist ids may appear; unknown/deleted are dropped.
+        let live_allowed: HashSet<u64> = HashSet::from([3u64, 50, 88]);
+        assert!(got.is_subset(&live_allowed), "got ids outside allowlist: {got:?}");
+        assert!(!got.contains(&7) && !got.contains(&999_999));
+        // Querying with vector 3 (allowed) surfaces it.
+        assert!(got.contains(&3));
     }
 }

@@ -149,6 +149,39 @@ fn turbovec_search(
     TableIterator::new(rows.into_iter())
 }
 
+/// Top-`k` nearest rows for `query`, restricted to the heap tuples in
+/// `allowlist` — the hybrid-RAG path. A SQL `WHERE` / tenant / ACL predicate
+/// produces the candidate ctids; turbovec ranks only within them and skips
+/// whole segments that own none of the allowed tuples (so a selective filter
+/// avoids most of the SIMD work instead of over-fetching and discarding).
+///
+/// ctids in the allowlist that are no longer indexed (deleted, or never
+/// added) are ignored.
+//
+// NOTE: `Vec<pg_sys::ItemPointerData>` maps to SQL `tid[]`. If a given pgrx
+// release prefers `pgrx::Array<'_, pg_sys::ItemPointerData>` for array params,
+// swap the parameter type and iterate the Array instead — the body is identical.
+#[pg_extern]
+fn turbovec_search_filtered(
+    name: &str,
+    query: Vec<f32>,
+    k: i32,
+    allowlist: Vec<pg_sys::ItemPointerData>,
+) -> TableIterator<'static, (name!(ctid, pg_sys::ItemPointerData), name!(score, f32))> {
+    let k = usize_arg("k", k);
+    let allowed: Vec<u64> = allowlist.into_iter().map(ctid_to_u64).collect();
+    let reg = registry().lock().unwrap();
+    let idx = reg
+        .get(name)
+        .unwrap_or_else(|| error!("no turbovec index '{name}' in this backend"));
+    let rows: Vec<(pg_sys::ItemPointerData, f32)> = idx
+        .search_with_allowlist(&query, k, &allowed)
+        .into_iter()
+        .map(|(id, score)| (u64_to_ctid(id), score))
+        .collect();
+    TableIterator::new(rows.into_iter())
+}
+
 /// Number of live vectors in the index.
 #[pg_extern]
 fn turbovec_size(name: &str) -> i64 {
@@ -214,6 +247,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(after, Some("(0,2)".to_string()));
+    }
+
+    #[pg_test]
+    fn filtered_search_restricts_to_allowlist() {
+        Spi::run("SELECT turbovec_create('f', 8, 4, 16)").unwrap();
+        Spi::run("SELECT turbovec_add('f', '(0,1)'::tid, ARRAY[1,0,0,0,0,0,0,0]::real[])")
+            .unwrap();
+        Spi::run("SELECT turbovec_add('f', '(0,2)'::tid, ARRAY[0,1,0,0,0,0,0,0]::real[])")
+            .unwrap();
+        Spi::run("SELECT turbovec_add('f', '(0,3)'::tid, ARRAY[0,0,1,0,0,0,0,0]::real[])")
+            .unwrap();
+
+        // The true nearest to the query is (0,1), but the allowlist excludes
+        // it — so the top hit must come from {(0,2),(0,3)} instead.
+        let top = Spi::get_one::<String>(
+            "SELECT ctid::text FROM turbovec_search_filtered('f', \
+             ARRAY[1,0,0,0,0,0,0,0]::real[], 5, ARRAY['(0,2)','(0,3)']::tid[])",
+        )
+        .unwrap();
+        assert!(top.is_some(), "filtered search returned no rows");
+        assert_ne!(
+            top,
+            Some("(0,1)".to_string()),
+            "allowlist failed to exclude (0,1)",
+        );
     }
 }
 

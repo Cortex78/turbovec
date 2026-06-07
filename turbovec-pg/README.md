@@ -25,7 +25,8 @@ glue file.
 
 1. **FFI shim** — `src/lib.rs`. `#[pg_extern]` functions:
    `turbovec_create`, `turbovec_add`, `turbovec_delete`, `turbovec_search`,
-   `turbovec_size`, `turbovec_save`, `turbovec_load`.
+   `turbovec_search_filtered` (hybrid allowlist), `turbovec_size`,
+   `turbovec_save`, `turbovec_load`.
 2. **ctid ⇄ u64 mapping** — [`turbovec-pg-engine/src/tid.rs`](../turbovec-pg-engine/src/tid.rs).
    A Postgres heap pointer (32-bit block + 16-bit offset) packs into the low 48
    bits of the `u64` that `turbovec::IdMapIndex` already uses for stable ids. So
@@ -73,7 +74,7 @@ confront, and where this PoC stands:
 | 5 | No C ABI (Rust + PyO3 only) | **Addressed** — pgrx provides the SQL-callable FFI surface. |
 | — | Stable id ↔ heap tuple | **Addressed** — ctid↔u64 mapping (`IdMapIndex` was already well-suited). |
 | 4 | No persistence / crash-safety | **Partial** — `save`/`load` to per-segment `.tvim` + manifest gives restart recovery; still no WAL crash-safety. |
-| 2 | Brute-force flat scan (O(N)) | **Unchanged** — each segment is still a full SIMD scan; segmentation doesn't add a coarse (IVF/HNSW) structure. |
+| 2 | Brute-force flat scan (O(N)) | **Partially mitigated** — a selective `search_filtered` allowlist skips whole segments; unfiltered search is still a full SIMD scan (no IVF/HNSW coarse structure). |
 | 3 | Per-backend rotation matrix / `rayon` pool | **Unchanged** — inherited from core. |
 | — | MVCC visibility, planner integration | **Out of scope** — see below. |
 
@@ -135,11 +136,13 @@ cargo pgrx test pg17                  # runs the #[pg_test] suite in src/lib.rs
 
 ## Roadmap (PoC → production)
 
-1. **Kernel-level filtering.** Surface `IdMapIndex::search_with_allowlist`
-   through a `turbovec_search(..., allowlist bigint[])` so SQL pre-filters skip
-   SIMD work instead of over-fetching — the hybrid-RAG path.
-2. **Shared, durable storage.** Move segments behind the buffer manager (or a
-   DSA/`mmap` segment store) so indexes are cross-backend and WAL-logged.
-3. **Global calibration + background merge/compaction** of small segments.
-4. **Real index AM / operator class** (`<#>` inner product, `<=>` cosine) so the
-   planner drives it — the step that makes it a true pgvector alternative.
+- [x] **Kernel-level filtering (hybrid RAG).** `turbovec_search_filtered(name,
+  query, k, allowlist tid[])` partitions the allowlist by segment and pushes
+  each subset into turbovec's block-granular kernel filter, skipping segments
+  that own no allowed tuples. (Engine: `SegmentedIndex::search_with_allowlist`,
+  unit-tested against a monolithic `IdMapIndex`.)
+- [ ] **Shared, durable storage.** Move segments behind the buffer manager (or a
+  DSA/`mmap` segment store) so indexes are cross-backend and WAL-logged.
+- [ ] **Global calibration + background merge/compaction** of small segments.
+- [ ] **Real index AM / operator class** (`<#>` inner product, `<=>` cosine) so
+  the planner drives it — the step that makes it a true pgvector alternative.
