@@ -68,6 +68,12 @@ SELECT turbovec_save('docs_idx', '/var/lib/postgresql/turbovec/docs_idx');  -- a
 SELECT turbovec_sync('docs_idx');                                           -- commit incrementally
 SELECT turbovec_load('docs_idx', '/var/lib/postgresql/turbovec/docs_idx');  -- re-open (e.g. another backend)
 
+-- ── Reclaim space from deletes ────────────────────────────────────────────────
+-- Deletes from sealed segments are tombstoned (their files are write-once).
+-- Run compaction periodically to rewrite affected segments without the deleted
+-- vectors; it also commits if the index is attached to a directory.
+SELECT turbovec_compact('docs_idx');   -- returns the number of segments compacted
+
 -- ⚠ ctid stability: this PoC treats ctid as a stable handle. That holds for
 -- insert-/append-mostly corpora (typical for RAG), but UPDATE and
 -- VACUUM FULL move tuples to new ctids. A production index AM hooks VACUUM to

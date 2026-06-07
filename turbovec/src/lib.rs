@@ -203,6 +203,48 @@ impl TurboQuantIndex {
         })
     }
 
+    /// Construct an index that **reuses** a pre-fit TQ+ calibration instead
+    /// of fitting its own from the first batch.
+    ///
+    /// Every [`add`](Self::add) then encodes against `(shift, scale)`, so
+    /// several indexes built with the same calibration share one quantization
+    /// coordinate system. That is what lets independently-built shards — e.g.
+    /// the segments of a larger store — produce directly comparable scores.
+    /// Read a fitted calibration back with [`Self::calibration`] and pass it
+    /// here.
+    ///
+    /// `shift` and `scale` must each have length `dim`.
+    ///
+    /// # Errors
+    /// Same as [`Self::new`] — `bit_width` must be in `{2, 3, 4}` and `dim` a
+    /// positive multiple of 8.
+    ///
+    /// # Panics
+    /// Panics if `shift.len() != dim` or `scale.len() != dim`.
+    pub fn with_calibration(
+        dim: usize,
+        bit_width: usize,
+        shift: Vec<f32>,
+        scale: Vec<f32>,
+    ) -> Result<Self, ConstructError> {
+        assert_eq!(
+            shift.len(),
+            dim,
+            "with_calibration: shift length {} must equal dim {dim}",
+            shift.len(),
+        );
+        assert_eq!(
+            scale.len(),
+            dim,
+            "with_calibration: scale length {} must equal dim {dim}",
+            scale.len(),
+        );
+        let mut idx = Self::new(dim, bit_width)?;
+        idx.tqplus_shift = shift;
+        idx.tqplus_scale = scale;
+        Ok(idx)
+    }
+
     /// Add a flat batch of vectors. `dim` must be set (either eagerly at
     /// construction or by a prior [`Self::add_2d`] call).
     ///
@@ -730,6 +772,21 @@ impl TurboQuantIndex {
 
     pub fn bit_width(&self) -> usize {
         self.bit_width
+    }
+
+    /// The TQ+ calibration `(shift, scale)` this index is currently using, or
+    /// `None` if it has none yet (freshly constructed with no add, or a
+    /// pre-TQ+ index loaded from a v2 file → identity calibration).
+    ///
+    /// The returned vectors have length [`Self::dim`]. Pass them to
+    /// [`Self::with_calibration`] to build another index in the same
+    /// quantization coordinate system.
+    pub fn calibration(&self) -> Option<(&[f32], &[f32])> {
+        if self.tqplus_shift.is_empty() {
+            None
+        } else {
+            Some((&self.tqplus_shift, &self.tqplus_scale))
+        }
     }
 }
 

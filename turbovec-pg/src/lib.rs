@@ -235,6 +235,23 @@ fn turbovec_load(name: &str, dir: &str) -> bool {
     true
 }
 
+/// Reclaim space from deletes: compact every sealed segment that still carries
+/// tombstoned (deleted) vectors in its write-once file, then commit if the
+/// index is attached to a directory. Returns the number of segments compacted.
+#[pg_extern]
+fn turbovec_compact(name: &str) -> i64 {
+    let mut reg = registry().lock().unwrap();
+    let idx = reg
+        .get_mut(name)
+        .unwrap_or_else(|| error!("no turbovec index '{name}' in this backend"));
+    let n = idx.compact_all();
+    if idx.is_attached() {
+        idx.sync()
+            .unwrap_or_else(|e| error!("turbovec_compact('{name}') sync: {e}"));
+    }
+    n as i64
+}
+
 // ─── In-database tests (cargo pgrx test) ─────────────────────────────────────
 
 #[cfg(any(test, feature = "pg_test"))]

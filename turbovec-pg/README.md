@@ -26,7 +26,8 @@ glue file.
 1. **FFI shim** — `src/lib.rs`. `#[pg_extern]` functions:
    `turbovec_create`, `turbovec_add`, `turbovec_delete`, `turbovec_search`,
    `turbovec_search_filtered` (hybrid allowlist), `turbovec_size`,
-   `turbovec_save` / `turbovec_sync` / `turbovec_load` (durable store).
+   `turbovec_save` / `turbovec_sync` / `turbovec_load` (durable store),
+   `turbovec_compact` (reclaim deleted space).
 2. **ctid ⇄ u64 mapping** — [`turbovec-pg-engine/src/tid.rs`](../turbovec-pg-engine/src/tid.rs).
    A Postgres heap pointer (32-bit block + 16-bit offset) packs into the low 48
    bits of the `u64` that `turbovec::IdMapIndex` already uses for stable ids. So
@@ -129,16 +130,13 @@ cargo pgrx test pg17                  # runs the #[pg_test] suite in src/lib.rs
   the snapshot. Persistence *is* crash-safe at the file level (atomic `CURRENT`
   commit), but it is not part of Postgres' transaction/WAL, so a crash rolls
   back to the last `turbovec_sync`, not to the last committed transaction.
-* **Unbounded tombstones.** Deletes from sealed segments are recorded as
-  tombstones (sealed files are write-once); they accumulate until a compaction
-  step (future) rewrites the segment.
+* **Manual compaction.** Deletes from sealed segments are tombstoned (sealed
+  files are write-once); `turbovec_compact` reclaims the space by rewriting the
+  affected segments. There is no automatic compaction trigger or background
+  merging of small segments yet.
 * **ctid stability.** The PoC treats ctid as a stable handle — true for
   insert-/append-mostly corpora (typical RAG), but `UPDATE` and `VACUUM FULL`
   move tuples. A real AM hooks VACUUM; until then, rebuild after bulk updates.
-* **Per-segment TQ+ calibration.** Each segment fits its own calibration on its
-  first batch; for cross-segment score comparability at >1000 vectors/segment a
-  production design fits one global calibration and shares it (needs
-  turbovec-core to expose its `tqplus_shift`/`tqplus_scale`).
 
 ## Roadmap (PoC → production)
 
@@ -153,7 +151,11 @@ cargo pgrx test pg17                  # runs the #[pg_test] suite in src/lib.rs
   re-opens the committed state. *Pending:* zero-copy shared memory / buffer-
   manager pages and Postgres-WAL integration so live writes are visible
   cross-backend without a re-open.
-- [ ] **Global calibration + background merge/compaction** of small segments
-  (also bounds tombstone growth).
+- [x] **Global calibration + compaction.** One TQ+ calibration is fit by the
+  first sealed segment and shared by every later segment (via `turbovec-core`'s
+  new `with_calibration` / `calibration`), so per-segment scores are directly
+  comparable; `turbovec_compact` reclaims tombstoned space by rewriting affected
+  segments. *Pending:* automatic compaction triggers and background merging of
+  small segments.
 - [ ] **Real index AM / operator class** (`<#>` inner product, `<=>` cosine) so
   the planner drives it — the step that makes it a true pgvector alternative.

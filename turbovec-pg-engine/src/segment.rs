@@ -46,9 +46,9 @@
 //! A proof of concept for the *build / lifecycle / durability* layer. It does
 //! not implement Postgres MVCC visibility, integration with Postgres' own
 //! WAL, or zero-copy shared memory across backends — see the `turbovec-pg`
-//! crate README for how those map onto a production design. Two known gaps:
-//! per-segment TQ+ calibration (see [`SegmentedIndex::add`]) and unbounded
-//! tombstone growth until sealed-segment compaction (a future step).
+//! crate README for how those map onto a production design. Tombstone growth
+//! from deletes is reclaimed on demand via [`SegmentedIndex::compact_all`]
+//! rather than automatically.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -153,6 +153,11 @@ pub struct SegmentedIndex {
     /// `sync` keep sealed files write-once (deletes are recorded here instead
     /// of rewriting the file) and lets `open` re-apply them.
     tombstones: HashSet<(u64, usize)>,
+    /// TQ+ calibration shared by every segment. Captured from the first
+    /// segment that fits one, then used to seed every later (hot) segment so
+    /// all segments quantize in the same coordinate system and their scores
+    /// are directly comparable. `None` until the first capture.
+    global_calib: Option<(Vec<f32>, Vec<f32>)>,
 }
 
 impl SegmentedIndex {
@@ -172,7 +177,22 @@ impl SegmentedIndex {
             generation: 0,
             seg_files: Vec::new(),
             tombstones: HashSet::new(),
+            global_calib: None,
         })
+    }
+
+    /// Build a fresh hot segment, seeded with the shared calibration if one
+    /// has been captured yet (so it quantizes in the same coordinate system as
+    /// every other segment). Falls back to a self-calibrating segment until
+    /// the first calibration is captured.
+    fn make_hot(&self) -> IdMapIndex {
+        match &self.global_calib {
+            Some((sh, sc)) => {
+                IdMapIndex::with_calibration(self.dim, self.bit_width, sh.clone(), sc.clone())
+            }
+            None => IdMapIndex::new(self.dim, self.bit_width),
+        }
+        .expect("dim/bit_width validated at construction")
     }
 
     /// Add `n = vectors.len() / dim` vectors with the given external ids.
@@ -181,17 +201,14 @@ impl SegmentedIndex {
     /// one) and unique within the batch; the whole batch is rejected if any
     /// id is already present, so a partial insert is impossible.
     ///
-    /// # Known PoC limitation — per-segment calibration
+    /// # Shared calibration
     ///
-    /// Each segment is an independent `IdMapIndex`, so each fits its own TQ+
-    /// per-coordinate calibration on its first batch (or falls back to
-    /// identity below turbovec's ~1000-sample floor). Search is
-    /// self-consistent *within* a segment, so ranking is correct, but two
-    /// large segments can encode the same coordinate against slightly
-    /// different calibrations. A production design would fit one global
-    /// calibration once and share it across segments — which needs
-    /// turbovec-core to expose its `tqplus_shift` / `tqplus_scale` vectors
-    /// (today they are `pub(crate)`).
+    /// The first segment that fits a TQ+ calibration becomes the index's
+    /// *shared* calibration; every later segment is seeded with it (via
+    /// [`IdMapIndex::with_calibration`]) so all segments quantize in one
+    /// coordinate system and their scores are directly comparable. With a
+    /// realistic `max_hot` (≥ turbovec's ~1000-sample floor) the very first
+    /// sealed segment fits it, so the whole store is uniform.
     pub fn add(&mut self, vectors: &[f32], ids: &[u64]) -> Result<(), AddError> {
         let dim = self.dim;
         if dim == 0 || vectors.len() % dim != 0 {
@@ -239,8 +256,18 @@ impl SegmentedIndex {
         // Warm the blocked layout now so the segment's first query after
         // sealing doesn't pay the one-time build cost.
         self.hot.prepare();
-        let fresh = IdMapIndex::new(self.dim, self.bit_width)
-            .expect("dim/bit_width validated at construction");
+        // Capture the shared calibration from the first segment that has one,
+        // so every later segment is seeded with it (via `make_hot`).
+        if self.global_calib.is_none() {
+            let captured = self
+                .hot
+                .calibration()
+                .map(|(sh, sc)| (sh.to_vec(), sc.to_vec()));
+            if let Some(c) = captured {
+                self.global_calib = Some(c);
+            }
+        }
+        let fresh = self.make_hot();
         let sealed_hot = std::mem::replace(&mut self.hot, fresh);
         self.sealed.push(sealed_hot);
         self.seg_files.push(None); // not yet written; persisted on next sync
@@ -399,6 +426,48 @@ impl SegmentedIndex {
     /// each successful [`sync`](Self::sync).
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Number of outstanding tombstones — vectors deleted from sealed segments
+    /// whose write-once files still physically contain them. Bounded by
+    /// [`compact_segment`](Self::compact_segment) / [`compact_all`](Self::compact_all).
+    pub fn tombstone_count(&self) -> usize {
+        self.tombstones.len()
+    }
+
+    /// True if this index is attached to a directory (via `save`/`open`) and
+    /// can [`sync`](Self::sync).
+    pub fn is_attached(&self) -> bool {
+        self.dir.is_some()
+    }
+
+    /// Compact one sealed segment: drop its tombstones and mark its on-disk
+    /// file stale so the next [`sync`](Self::sync) rewrites it without the
+    /// deleted vectors (which the in-memory segment already excludes — delete
+    /// applied `IdMapIndex::remove`). Returns `true` if the segment had
+    /// tombstones to clear.
+    ///
+    /// The rewrite is the only time a sealed file is overwritten; it stays
+    /// crash-safe because the rewrite is atomic and the still-committed
+    /// previous manifest's tombstones become no-ops against the smaller file.
+    pub fn compact_segment(&mut self, seg: usize) -> bool {
+        if seg >= self.sealed.len() {
+            return false;
+        }
+        if !self.tombstones.iter().any(|&(_, s)| s == seg) {
+            return false;
+        }
+        self.tombstones.retain(|&(_, s)| s != seg);
+        self.seg_files[seg] = None; // force rewrite of the compacted segment
+        true
+    }
+
+    /// Compact every sealed segment that carries tombstones. Returns the
+    /// number of segments compacted. The compacted segments are rewritten on
+    /// the next [`sync`](Self::sync).
+    pub fn compact_all(&mut self) -> usize {
+        let segs: HashSet<usize> = self.tombstones.iter().map(|&(_, s)| s).collect();
+        segs.into_iter().filter(|&s| self.compact_segment(s)).count()
     }
 
     pub fn dim(&self) -> usize {
@@ -573,6 +642,15 @@ impl SegmentedIndex {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
 
+        // Recover the shared calibration from a persisted segment (every
+        // segment stores its own in its `.tvim`, and they all share it). This
+        // is what `seal` would have captured, so later seals stay consistent.
+        let global_calib = sealed
+            .first()
+            .and_then(|s| s.calibration())
+            .or_else(|| hot.calibration())
+            .map(|(sh, sc)| (sh.to_vec(), sc.to_vec()));
+
         let mut me = Self {
             dim: manifest.dim,
             bit_width: manifest.bit_width,
@@ -585,6 +663,7 @@ impl SegmentedIndex {
             generation,
             seg_files: manifest.seg_files.into_iter().map(Some).collect(),
             tombstones,
+            global_calib,
         };
 
         // Write-once segment files still physically contain deleted ids — prune
@@ -1092,6 +1171,114 @@ mod tests {
         // A vector committed by the second handle is retrievable.
         let q = &v2[0..dim];
         assert!(c.search(q, 80).iter().any(|(id, _)| *id == 50));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Anisotropic vectors (per-coordinate scaling) so the fitted TQ+
+    /// calibration is clearly non-identity.
+    fn gen_anisotropic(n: usize, dim: usize, seed: u64) -> Vec<f32> {
+        let mut v = gen(n, dim, seed);
+        for i in 0..n {
+            for j in 0..dim {
+                v[i * dim + j] *= 1.0 + 4.0 * (j as f32) / (dim as f32);
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn global_calibration_shared_across_segments() {
+        let dim = 64;
+        let max_hot = 1200; // above turbovec's ~1000-sample calibration floor
+        let n = 3000;
+        let vecs = gen_anisotropic(n, dim, 123);
+        let ids: Vec<u64> = (0..n as u64).collect();
+        let mut idx = SegmentedIndex::new(dim, 4, max_hot).unwrap();
+        // First add to each segment is a full `max_hot` batch, so the first
+        // sealed segment fits a real (non-identity) calibration.
+        for cs in (0..n).step_by(max_hot) {
+            let e = (cs + max_hot).min(n);
+            idx.add(&vecs[cs * dim..e * dim], &ids[cs..e]).unwrap();
+        }
+        assert!(idx.n_sealed() >= 2, "expected >=2 sealed, got {}", idx.n_sealed());
+
+        let (c0_sh, c0_sc) = {
+            let (sh, sc) = idx.sealed[0].calibration().expect("seg0 calibration");
+            (sh.to_vec(), sc.to_vec())
+        };
+
+        // Every sealed segment shares segment 0's calibration exactly.
+        for (k, seg) in idx.sealed.iter().enumerate() {
+            let (sh, sc) = seg.calibration().expect("segment calibration");
+            assert_eq!(sh, &c0_sh[..], "segment {k} shift differs from segment 0");
+            assert_eq!(sc, &c0_sc[..], "segment {k} scale differs from segment 0");
+        }
+        // The hot segment was seeded with the shared calibration too.
+        if let Some((sh, sc)) = idx.hot.calibration() {
+            assert_eq!(sh, &c0_sh[..]);
+            assert_eq!(sc, &c0_sc[..]);
+        }
+
+        // ...and it is a genuine, non-identity calibration (not the trivial
+        // shift=0/scale=1 fallback), which is the whole point of sharing it.
+        let max_scale_dev = c0_sc.iter().fold(0.0f32, |m, &s| m.max((s - 1.0).abs()));
+        assert!(
+            max_scale_dev > 0.05,
+            "calibration looks like identity (max |scale-1| = {max_scale_dev})",
+        );
+    }
+
+    #[test]
+    fn compaction_shrinks_segment_and_clears_tombstones() {
+        let dim = 64;
+        let n = 120;
+        let vecs = gen(n, dim, 55);
+        let ids: Vec<u64> = (0..n as u64).collect();
+        let mut idx = SegmentedIndex::new(dim, 4, 32).unwrap();
+        for cs in (0..n).step_by(20) {
+            let e = (cs + 20).min(n);
+            idx.add(&vecs[cs * dim..e * dim], &ids[cs..e]).unwrap();
+        }
+        assert!(idx.n_sealed() >= 1);
+
+        let dir = unique_tmp_dir("compact");
+        idx.save(&dir).unwrap(); // gen 1: seg-0 written with all of its ids
+        let seg0_path = dir.join("seg-00000000.tvim");
+        let size_full = std::fs::read(&seg0_path).unwrap().len();
+
+        // Delete ids that live in seg-0 (ids 0..40). The sealed file is
+        // write-once, so the next sync does NOT rewrite it — the ids stay in
+        // the file and are carried as tombstones.
+        for id in [1u64, 2, 3, 4, 5] {
+            assert!(idx.remove(id));
+        }
+        assert_eq!(idx.tombstone_count(), 5);
+        idx.save(&dir).unwrap(); // gen 2: seg-0 untouched (write-once)
+        assert_eq!(
+            std::fs::read(&seg0_path).unwrap().len(),
+            size_full,
+            "seg-0 was rewritten before compaction",
+        );
+
+        // Compact: clears the tombstones and marks seg-0 stale so the next
+        // sync rewrites it without the deleted vectors.
+        assert!(idx.compact_all() >= 1);
+        assert_eq!(idx.tombstone_count(), 0);
+        idx.save(&dir).unwrap(); // gen 3: seg-0 rewritten, compacted
+        let size_compacted = std::fs::read(&seg0_path).unwrap().len();
+        assert!(
+            size_compacted < size_full,
+            "compacted seg-0 did not shrink ({size_compacted} >= {size_full})",
+        );
+
+        // Reopen: deleted ids are gone, no tombstones remain, survivors intact.
+        let reopened = SegmentedIndex::open(&dir).unwrap();
+        assert_eq!(reopened.len(), n - 5);
+        assert_eq!(reopened.tombstone_count(), 0);
+        for id in [1u64, 2, 3, 4, 5] {
+            assert!(!reopened.contains(id));
+        }
+        assert!(reopened.contains(10));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

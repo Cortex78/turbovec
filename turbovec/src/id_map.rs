@@ -74,6 +74,23 @@ impl IdMapIndex {
         })
     }
 
+    /// Construct an id-map index that reuses a pre-fit TQ+ calibration. See
+    /// [`TurboQuantIndex::with_calibration`] — this is the id-mapped wrapper
+    /// over it, used to build segments that share one calibration so their
+    /// scores are directly comparable.
+    pub fn with_calibration(
+        dim: usize,
+        bit_width: usize,
+        shift: Vec<f32>,
+        scale: Vec<f32>,
+    ) -> Result<Self, ConstructError> {
+        Ok(Self {
+            inner: TurboQuantIndex::with_calibration(dim, bit_width, shift, scale)?,
+            slot_to_id: Vec::new(),
+            id_to_slot: HashMap::new(),
+        })
+    }
+
     /// Add `n = vectors.len() / dim` vectors with the given external ids.
     /// Requires the inner index's dim to already be set (eager constructor
     /// or a previous lazy add).
@@ -263,6 +280,12 @@ impl IdMapIndex {
 
     pub fn bit_width(&self) -> usize {
         self.inner.bit_width()
+    }
+
+    /// The TQ+ calibration `(shift, scale)` this index is using, or `None` if
+    /// it has none yet. See [`TurboQuantIndex::calibration`].
+    pub fn calibration(&self) -> Option<(&[f32], &[f32])> {
+        self.inner.calibration()
     }
 
     /// Eagerly populate the inner search caches. See
