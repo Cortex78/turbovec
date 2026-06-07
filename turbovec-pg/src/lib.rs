@@ -192,24 +192,45 @@ fn turbovec_size(name: &str) -> i64 {
     idx.len() as i64
 }
 
-/// Persist the index (per-segment `.tvim` files + manifest) under `dir`.
+/// Durably persist the index under `dir` (attaching it if not already) and
+/// commit. Crash-safe and incremental: sealed segments are write-once, only
+/// the changed hot snapshot + manifest are (re)written, and a single atomic
+/// rename of `CURRENT` commits the new generation — a crash leaves the prior
+/// committed generation intact.
 #[pg_extern]
 fn turbovec_save(name: &str, dir: &str) -> bool {
-    let reg = registry().lock().unwrap();
+    let mut reg = registry().lock().unwrap();
     let idx = reg
-        .get(name)
+        .get_mut(name)
         .unwrap_or_else(|| error!("no turbovec index '{name}' in this backend"));
     idx.save(dir)
         .unwrap_or_else(|e| error!("turbovec_save('{name}', '{dir}'): {e}"));
     true
 }
 
-/// Load an index previously written by [`turbovec_save`] into this backend
-/// under `name` (replacing any existing index of that name).
+/// Commit a new durable generation of an already-attached index (one created
+/// by a prior `turbovec_save` or `turbovec_load`). Cheaper than `turbovec_save`
+/// in steady state — it writes only newly-sealed segments plus the hot
+/// snapshot and manifest.
+#[pg_extern]
+fn turbovec_sync(name: &str) -> bool {
+    let mut reg = registry().lock().unwrap();
+    let idx = reg
+        .get_mut(name)
+        .unwrap_or_else(|| error!("no turbovec index '{name}' in this backend"));
+    idx.sync()
+        .unwrap_or_else(|e| error!("turbovec_sync('{name}'): {e}"));
+    true
+}
+
+/// Open the last committed generation of a durable store under `dir` into this
+/// backend as `name` (replacing any existing index of that name). The index
+/// stays attached, so later `turbovec_sync('{name}')` calls commit
+/// incrementally to the same directory.
 #[pg_extern]
 fn turbovec_load(name: &str, dir: &str) -> bool {
     let idx =
-        SegmentedIndex::load(dir).unwrap_or_else(|e| error!("turbovec_load('{dir}'): {e}"));
+        SegmentedIndex::open(dir).unwrap_or_else(|e| error!("turbovec_load('{dir}'): {e}"));
     registry().lock().unwrap().insert(name.to_string(), idx);
     true
 }

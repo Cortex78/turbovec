@@ -26,7 +26,7 @@ glue file.
 1. **FFI shim** — `src/lib.rs`. `#[pg_extern]` functions:
    `turbovec_create`, `turbovec_add`, `turbovec_delete`, `turbovec_search`,
    `turbovec_search_filtered` (hybrid allowlist), `turbovec_size`,
-   `turbovec_save`, `turbovec_load`.
+   `turbovec_save` / `turbovec_sync` / `turbovec_load` (durable store).
 2. **ctid ⇄ u64 mapping** — [`turbovec-pg-engine/src/tid.rs`](../turbovec-pg-engine/src/tid.rs).
    A Postgres heap pointer (32-bit block + 16-bit offset) packs into the low 48
    bits of the `u64` that `turbovec::IdMapIndex` already uses for stable ids. So
@@ -73,7 +73,7 @@ confront, and where this PoC stands:
 | 1 | Rebuild-the-whole-layout on every write | **Addressed** — segment build bounds rebuilds to `max_hot` / one segment. |
 | 5 | No C ABI (Rust + PyO3 only) | **Addressed** — pgrx provides the SQL-callable FFI surface. |
 | — | Stable id ↔ heap tuple | **Addressed** — ctid↔u64 mapping (`IdMapIndex` was already well-suited). |
-| 4 | No persistence / crash-safety | **Partial** — `save`/`load` to per-segment `.tvim` + manifest gives restart recovery; still no WAL crash-safety. |
+| 4 | No persistence / crash-safety | **Addressed at file level** — incremental, write-once segments committed by an atomic `CURRENT` rename (a crash leaves the prior generation intact); any process re-opens the committed state. Integration with Postgres' own WAL still pending. |
 | 2 | Brute-force flat scan (O(N)) | **Partially mitigated** — a selective `search_filtered` allowlist skips whole segments; unfiltered search is still a full SIMD scan (no IVF/HNSW coarse structure). |
 | 3 | Per-backend rotation matrix / `rayon` pool | **Unchanged** — inherited from core. |
 | — | MVCC visibility, planner integration | **Out of scope** — see below. |
@@ -117,15 +117,21 @@ cargo pgrx test pg17                  # runs the #[pg_test] suite in src/lib.rs
 
 ## Limitations
 
-* **Per-backend, in-memory state.** The registry is a process-local static, so
-  an index is visible only to the connection that built it and is lost on
-  backend exit (mitigate with `turbovec_save`/`turbovec_load`). Production needs
-  shared memory / DSA or page-backed storage through the buffer manager.
+* **Per-backend live state.** The live index is a process-local static, visible
+  only to the connection that built or opened it. `turbovec_save` /
+  `turbovec_sync` make it durable and `turbovec_load` lets another backend
+  re-open the committed state, but there is no shared *live* view yet — that
+  needs shared memory / buffer-manager pages.
 * **Not an index access method.** Search is an explicit function call, so the
   planner can't choose it for `ORDER BY embedding <#> q LIMIT k`, and it can't
   combine with a `WHERE` via a bitmap scan.
-* **No MVCC / WAL.** No tuple-visibility recheck against the snapshot; no
-  crash-safety. A crash loses in-memory state (reload from the last `save`).
+* **No MVCC; not tied into Postgres' WAL.** No tuple-visibility recheck against
+  the snapshot. Persistence *is* crash-safe at the file level (atomic `CURRENT`
+  commit), but it is not part of Postgres' transaction/WAL, so a crash rolls
+  back to the last `turbovec_sync`, not to the last committed transaction.
+* **Unbounded tombstones.** Deletes from sealed segments are recorded as
+  tombstones (sealed files are write-once); they accumulate until a compaction
+  step (future) rewrites the segment.
 * **ctid stability.** The PoC treats ctid as a stable handle — true for
   insert-/append-mostly corpora (typical RAG), but `UPDATE` and `VACUUM FULL`
   move tuples. A real AM hooks VACUUM; until then, rebuild after bulk updates.
@@ -141,8 +147,13 @@ cargo pgrx test pg17                  # runs the #[pg_test] suite in src/lib.rs
   each subset into turbovec's block-granular kernel filter, skipping segments
   that own no allowed tuples. (Engine: `SegmentedIndex::search_with_allowlist`,
   unit-tested against a monolithic `IdMapIndex`.)
-- [ ] **Shared, durable storage.** Move segments behind the buffer manager (or a
-  DSA/`mmap` segment store) so indexes are cross-backend and WAL-logged.
-- [ ] **Global calibration + background merge/compaction** of small segments.
+- [~] **Durable, shareable storage.** *Done:* crash-safe, incremental on-disk
+  segments with atomic `CURRENT`-pointer commits (`SegmentedIndex::sync`/`open`,
+  exposed as `turbovec_save`/`turbovec_sync`/`turbovec_load`); any process
+  re-opens the committed state. *Pending:* zero-copy shared memory / buffer-
+  manager pages and Postgres-WAL integration so live writes are visible
+  cross-backend without a re-open.
+- [ ] **Global calibration + background merge/compaction** of small segments
+  (also bounds tombstone growth).
 - [ ] **Real index AM / operator class** (`<#>` inner product, `<=>` cosine) so
   the planner drives it — the step that makes it a true pgvector alternative.

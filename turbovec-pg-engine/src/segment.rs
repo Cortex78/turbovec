@@ -29,16 +29,31 @@
 //! only rebuild cost is that segment's blocked layout on its next search —
 //! again bounded by segment size, not corpus size.
 //!
+//! # Durability
+//!
+//! [`SegmentedIndex::sync`] persists the index incrementally and
+//! crash-safely: sealed segments are **write-once** files, the changing hot
+//! segment is snapshotted per generation, and a single atomic rename of a
+//! `CURRENT` pointer commits each generation. A crash leaves the previous
+//! committed generation fully intact (an interrupted `sync` writes new files
+//! but never flips `CURRENT`). [`SegmentedIndex::open`] re-opens the last
+//! committed state, so any process can attach to the same on-disk store —
+//! the (PoC-level) "shared across backends" story: a shared, durable source
+//! of truth that readers re-open to see a writer's committed generations.
+//!
 //! # What this is *not* (yet)
 //!
-//! This is a proof of concept for the *build/lifecycle* layer. It does not
-//! implement Postgres MVCC visibility, WAL crash-safety, or shared-memory
-//! storage — see the `turbovec-pg` crate README for how those map onto a
-//! production design. One concrete known gap is called out at
-//! [`SegmentedIndex::add`]: each segment fits its own TQ+ calibration.
+//! A proof of concept for the *build / lifecycle / durability* layer. It does
+//! not implement Postgres MVCC visibility, integration with Postgres' own
+//! WAL, or zero-copy shared memory across backends — see the `turbovec-pg`
+//! crate README for how those map onto a production design. Two known gaps:
+//! per-segment TQ+ calibration (see [`SegmentedIndex::add`]) and unbounded
+//! tombstone growth until sealed-segment compaction (a future step).
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::fs::File;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use turbovec::{AddError, ConstructError, IdMapIndex};
@@ -52,17 +67,62 @@ enum Owner {
     Sealed(usize),
 }
 
-/// On-disk manifest written alongside the per-segment `.tvim` files.
+/// Bumped if the on-disk manifest shape changes; `open` refuses other values.
+const MANIFEST_FORMAT: u32 = 2;
+
+/// One committed generation's manifest. Written as `MANIFEST-<gen>`; the
+/// `CURRENT` file names the active one.
 #[derive(Serialize, Deserialize)]
 struct Manifest {
+    format: u32,
     dim: usize,
     bit_width: usize,
     max_hot: usize,
     n_sealed: usize,
-    /// `owner` flattened to parallel arrays. `owner_seg[i] == -1` means the
-    /// id lives in the hot segment; otherwise it is a sealed-segment index.
+    /// File name of each sealed segment (write-once, ordinal-stable).
+    seg_files: Vec<String>,
+    /// File name of the hot-segment snapshot for this generation.
+    hot_file: String,
+    /// Live `owner` flattened to parallel arrays. `owner_seg[i] == -1` means
+    /// the id lives in the hot segment; otherwise it is a sealed-segment index.
     owner_ids: Vec<u64>,
     owner_seg: Vec<i64>,
+    /// Ids deleted from a sealed segment, with the owning sealed index. The
+    /// write-once segment files still physically contain these ids, so `open`
+    /// re-applies the deletes to match the live set.
+    tombstone_ids: Vec<u64>,
+    tombstone_seg: Vec<usize>,
+}
+
+// ─── Crash-safe file primitives ──────────────────────────────────────────────
+
+/// Write bytes to `dir/name` atomically: write `name.tmp`, fsync it, rename
+/// over `name`. A crash leaves either the old `name` or nothing — never a
+/// torn file.
+fn write_bytes_atomic(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+    let tmp = dir.join(format!("{name}.tmp"));
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, dir.join(name))
+}
+
+/// Write an `IdMapIndex` to `dir/name` atomically (tmp + fsync + rename).
+fn write_index_atomic(idx: &IdMapIndex, dir: &Path, name: &str) -> io::Result<()> {
+    let tmp = dir.join(format!("{name}.tmp"));
+    idx.write(&tmp)?;
+    File::open(&tmp)?.sync_all()?; // IdMapIndex::write flushes but doesn't fsync
+    std::fs::rename(&tmp, dir.join(name))
+}
+
+/// Best-effort directory fsync so a rename is durably recorded. Ignored on
+/// platforms that don't allow opening a directory for sync.
+fn fsync_dir(dir: &Path) {
+    if let Ok(f) = File::open(dir) {
+        let _ = f.sync_all();
+    }
 }
 
 /// A segmented, incrementally-mutable index over turbovec.
@@ -80,6 +140,19 @@ pub struct SegmentedIndex {
     /// The ids currently in the hot segment, so sealing can re-point them
     /// from `Owner::Hot` to `Owner::Sealed(_)` without scanning `owner`.
     hot_ids: HashSet<u64>,
+
+    // ── Durable-store bookkeeping (used by `sync` / `open`) ──
+    /// Directory backing this index, once attached via `save`/`open`.
+    dir: Option<PathBuf>,
+    /// Last committed generation number (0 = never synced).
+    generation: u64,
+    /// On-disk file name for each sealed segment, parallel to `sealed`.
+    /// `None` = sealed in memory but not yet written (write-once on next sync).
+    seg_files: Vec<Option<String>>,
+    /// Ids deleted from a sealed segment, with the owning sealed index. Lets
+    /// `sync` keep sealed files write-once (deletes are recorded here instead
+    /// of rewriting the file) and lets `open` re-apply them.
+    tombstones: HashSet<(u64, usize)>,
 }
 
 impl SegmentedIndex {
@@ -95,6 +168,10 @@ impl SegmentedIndex {
             hot,
             owner: HashMap::new(),
             hot_ids: HashSet::new(),
+            dir: None,
+            generation: 0,
+            seg_files: Vec::new(),
+            tombstones: HashSet::new(),
         })
     }
 
@@ -166,6 +243,7 @@ impl SegmentedIndex {
             .expect("dim/bit_width validated at construction");
         let sealed_hot = std::mem::replace(&mut self.hot, fresh);
         self.sealed.push(sealed_hot);
+        self.seg_files.push(None); // not yet written; persisted on next sync
         for id in self.hot_ids.drain() {
             self.owner.insert(id, Owner::Sealed(new_idx));
         }
@@ -178,10 +256,20 @@ impl SegmentedIndex {
         match self.owner.remove(&id) {
             None => false,
             Some(Owner::Hot) => {
+                // Hot is rewritten in full on every sync, so a hot delete is
+                // durable without a tombstone.
                 self.hot_ids.remove(&id);
                 self.hot.remove(id)
             }
-            Some(Owner::Sealed(seg)) => self.sealed[seg].remove(id),
+            Some(Owner::Sealed(seg)) => {
+                let removed = self.sealed[seg].remove(id);
+                if removed {
+                    // The sealed file is write-once, so record the delete to
+                    // re-apply on open instead of rewriting the segment.
+                    self.tombstones.insert((id, seg));
+                }
+                removed
+            }
         }
     }
 
@@ -307,6 +395,12 @@ impl SegmentedIndex {
         self.sealed.len()
     }
 
+    /// Last committed durability generation (0 = never synced). Increments on
+    /// each successful [`sync`](Self::sync).
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn dim(&self) -> usize {
         self.dim
     }
@@ -320,16 +414,63 @@ impl SegmentedIndex {
         self.owner.contains_key(&id)
     }
 
-    /// Persist every segment as a `.tvim` file plus a JSON manifest under
-    /// `dir`. Round-trips through [`SegmentedIndex::load`].
-    pub fn save(&self, dir: impl AsRef<Path>) -> std::io::Result<()> {
-        let dir = dir.as_ref();
-        std::fs::create_dir_all(dir)?;
-        for (i, seg) in self.sealed.iter().enumerate() {
-            seg.write(dir.join(format!("seg_{i}.tvim")))?;
-        }
-        self.hot.write(dir.join("hot.tvim"))?;
+    /// Incrementally and crash-safely persist the index to its attached
+    /// directory (set by a prior [`save`](Self::save) or [`open`](Self::open)).
+    ///
+    /// Each call:
+    /// 1. writes any not-yet-persisted **sealed** segments — once each, never
+    ///    rewritten (deletes are carried as tombstones, not file rewrites);
+    /// 2. snapshots the hot segment to `hot-<gen>.tvim`;
+    /// 3. writes `MANIFEST-<gen>`; and
+    /// 4. **atomically renames** `CURRENT` to name the new manifest — the
+    ///    single commit point. A crash before that rename leaves the previous
+    ///    committed generation fully intact.
+    ///
+    /// So an append-mostly workload only ever writes the new segment(s) + a
+    /// small hot snapshot + the manifest per sync, not the whole corpus.
+    pub fn sync(&mut self) -> io::Result<()> {
+        let dir = self.dir.clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                "sync() on a detached index; call save(dir) or open(dir) first",
+            )
+        })?;
+        std::fs::create_dir_all(&dir)?;
+        let gen = self.generation + 1;
 
+        // 1. Persist any sealed segments that aren't on disk yet (write-once).
+        for i in 0..self.sealed.len() {
+            if self.seg_files[i].is_none() {
+                let name = format!("seg-{i:08}.tvim");
+                write_index_atomic(&self.sealed[i], &dir, &name)?;
+                self.seg_files[i] = Some(name);
+            }
+        }
+
+        // 2. Snapshot the (mutable) hot segment for this generation.
+        let hot_file = format!("hot-{gen:08}.tvim");
+        write_index_atomic(&self.hot, &dir, &hot_file)?;
+
+        // 3. Write the manifest for this generation.
+        let manifest = self.build_manifest(&hot_file);
+        let manifest_name = format!("MANIFEST-{gen:08}");
+        let json = serde_json::to_vec(&manifest)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        write_bytes_atomic(&dir, &manifest_name, &json)?;
+
+        // 4. Commit: atomically flip CURRENT to the new manifest.
+        write_bytes_atomic(&dir, "CURRENT", manifest_name.as_bytes())?;
+        fsync_dir(&dir);
+
+        // 5. GC the superseded generation's hot snapshot + manifest (never the
+        //    committed generation, never write-once sealed files).
+        gc_old_generations(&dir, gen);
+
+        self.generation = gen;
+        Ok(())
+    }
+
+    fn build_manifest(&self, hot_file: &str) -> Manifest {
         let mut owner_ids = Vec::with_capacity(self.owner.len());
         let mut owner_seg = Vec::with_capacity(self.owner.len());
         for (&id, &own) in &self.owner {
@@ -339,32 +480,77 @@ impl SegmentedIndex {
                 Owner::Sealed(s) => s as i64,
             });
         }
-        let manifest = Manifest {
+        let mut tombstone_ids = Vec::with_capacity(self.tombstones.len());
+        let mut tombstone_seg = Vec::with_capacity(self.tombstones.len());
+        for &(id, seg) in &self.tombstones {
+            tombstone_ids.push(id);
+            tombstone_seg.push(seg);
+        }
+        Manifest {
+            format: MANIFEST_FORMAT,
             dim: self.dim,
             bit_width: self.bit_width,
             max_hot: self.max_hot,
             n_sealed: self.sealed.len(),
+            seg_files: self
+                .seg_files
+                .iter()
+                .map(|f| f.clone().expect("all sealed segments persisted before manifest"))
+                .collect(),
+            hot_file: hot_file.to_string(),
             owner_ids,
             owner_seg,
-        };
-        let f = std::fs::File::create(dir.join("manifest.json"))?;
-        serde_json::to_writer(f, &manifest)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        Ok(())
+            tombstone_ids,
+            tombstone_seg,
+        }
     }
 
-    /// Reload an index previously written by [`SegmentedIndex::save`].
-    pub fn load(dir: impl AsRef<Path>) -> std::io::Result<Self> {
-        let dir = dir.as_ref();
-        let f = std::fs::File::open(dir.join("manifest.json"))?;
-        let manifest: Manifest = serde_json::from_reader(f)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    /// Attach the index to `dir` and persist it. If already attached to the
+    /// same directory this is an incremental [`sync`](Self::sync); attaching to
+    /// a different directory re-roots and writes a full copy there.
+    pub fn save(&mut self, dir: impl AsRef<Path>) -> io::Result<()> {
+        let dir = dir.as_ref().to_path_buf();
+        match &self.dir {
+            Some(cur) if *cur == dir => {}
+            _ => {
+                self.dir = Some(dir);
+                self.generation = 0;
+                for f in self.seg_files.iter_mut() {
+                    *f = None; // force a full write into the new location
+                }
+            }
+        }
+        self.sync()
+    }
+
+    /// Open the last committed generation of a durable store under `dir`. The
+    /// returned index stays attached, so subsequent [`sync`](Self::sync) calls
+    /// continue incrementally.
+    pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
+        let dir = dir.as_ref().to_path_buf();
+        let manifest_name = std::fs::read_to_string(dir.join("CURRENT"))?;
+        let manifest_name = manifest_name.trim().to_string();
+        let bytes = std::fs::read(dir.join(&manifest_name))?;
+        let manifest: Manifest = serde_json::from_slice(&bytes)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if manifest.format != MANIFEST_FORMAT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported manifest format {}", manifest.format),
+            ));
+        }
+        if manifest.seg_files.len() != manifest.n_sealed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "manifest seg_files length does not match n_sealed",
+            ));
+        }
 
         let mut sealed = Vec::with_capacity(manifest.n_sealed);
-        for i in 0..manifest.n_sealed {
-            sealed.push(IdMapIndex::load(dir.join(format!("seg_{i}.tvim")))?);
+        for name in &manifest.seg_files {
+            sealed.push(IdMapIndex::load(dir.join(name))?);
         }
-        let hot = IdMapIndex::load(dir.join("hot.tvim"))?;
+        let hot = IdMapIndex::load(dir.join(&manifest.hot_file))?;
 
         let mut owner = HashMap::with_capacity(manifest.owner_ids.len());
         let mut hot_ids = HashSet::new();
@@ -377,7 +563,17 @@ impl SegmentedIndex {
             }
         }
 
-        Ok(Self {
+        let mut tombstones = HashSet::with_capacity(manifest.tombstone_ids.len());
+        for (&id, &seg) in manifest.tombstone_ids.iter().zip(manifest.tombstone_seg.iter()) {
+            tombstones.insert((id, seg));
+        }
+
+        let generation = manifest_name
+            .strip_prefix("MANIFEST-")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+
+        let mut me = Self {
             dim: manifest.dim,
             bit_width: manifest.bit_width,
             max_hot: manifest.max_hot,
@@ -385,7 +581,50 @@ impl SegmentedIndex {
             hot,
             owner,
             hot_ids,
-        })
+            dir: Some(dir),
+            generation,
+            seg_files: manifest.seg_files.into_iter().map(Some).collect(),
+            tombstones,
+        };
+
+        // Write-once segment files still physically contain deleted ids — prune
+        // them so search matches the live set. `remove` is a no-op (returns
+        // false) for ids already absent, so applying every tombstone is safe.
+        let to_remove: Vec<(u64, usize)> = me.tombstones.iter().copied().collect();
+        for (id, seg) in to_remove {
+            if seg < me.sealed.len() {
+                me.sealed[seg].remove(id);
+            }
+        }
+
+        Ok(me)
+    }
+
+    /// Alias for [`open`](Self::open), kept for call-site compatibility.
+    pub fn load(dir: impl AsRef<Path>) -> io::Result<Self> {
+        Self::open(dir)
+    }
+}
+
+/// Delete superseded `hot-<gen>` snapshots and `MANIFEST-<gen>` files whose
+/// generation is older than `keep_gen`. Never touches `seg-*` (write-once),
+/// `CURRENT`, or the kept generation. Best-effort: GC failures are ignored.
+fn gc_old_generations(dir: &Path, keep_gen: u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let stale = name
+            .strip_prefix("hot-")
+            .and_then(|s| s.strip_suffix(".tvim"))
+            .or_else(|| name.strip_prefix("MANIFEST-"))
+            .and_then(|s| s.parse::<u64>().ok())
+            .is_some_and(|g| g < keep_gen);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -695,5 +934,164 @@ mod tests {
         assert!(!got.contains(&7) && !got.contains(&999_999));
         // Querying with vector 3 (allowed) surfaces it.
         assert!(got.contains(&3));
+    }
+
+    #[test]
+    fn durable_sync_open_round_trip() {
+        let dim = 64;
+        let n = 150;
+        let vecs = gen(n, dim, 5);
+        let ids: Vec<u64> = (1000..1000 + n as u64).collect();
+        let mut idx = SegmentedIndex::new(dim, 4, 40).unwrap();
+        idx.add(&vecs, &ids).unwrap();
+
+        let dir = unique_tmp_dir("durable_rt");
+        idx.save(&dir).unwrap();
+        assert_eq!(idx.generation(), 1);
+
+        let reopened = SegmentedIndex::open(&dir).unwrap();
+        assert_eq!(reopened.len(), idx.len());
+        assert_eq!(reopened.n_sealed(), idx.n_sealed());
+        assert_eq!(reopened.generation(), 1);
+
+        let queries = gen(8, dim, 77);
+        for q in 0..8 {
+            let query = &queries[q * dim..(q + 1) * dim];
+            let a: Vec<u64> = idx.search(query, 7).iter().map(|(id, _)| *id).collect();
+            let b: Vec<u64> = reopened.search(query, 7).iter().map(|(id, _)| *id).collect();
+            assert_eq!(a, b, "query {q}: result order changed after reopen");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn durable_sync_is_incremental_and_write_once() {
+        let dim = 64;
+        let mut idx = SegmentedIndex::new(dim, 4, 32).unwrap();
+        let vecs = gen(80, dim, 31);
+        let ids: Vec<u64> = (0..80).collect();
+        for cs in (0..80).step_by(20) {
+            idx.add(&vecs[cs * dim..(cs + 20) * dim], &ids[cs..cs + 20]).unwrap();
+        }
+        assert_eq!(idx.n_sealed(), 2);
+
+        let dir = unique_tmp_dir("durable_inc");
+        idx.save(&dir).unwrap();
+        assert_eq!(idx.generation(), 1);
+        let seg0 = dir.join("seg-00000000.tvim");
+        let seg0_bytes = std::fs::read(&seg0).unwrap();
+
+        // Add a third sealed segment, then sync incrementally to the same dir.
+        let more = gen(40, dim, 32);
+        let more_ids: Vec<u64> = (80..120).collect();
+        for cs in (0..40).step_by(20) {
+            idx.add(&more[cs * dim..(cs + 20) * dim], &more_ids[cs..cs + 20]).unwrap();
+        }
+        assert_eq!(idx.n_sealed(), 3);
+        idx.save(&dir).unwrap();
+        assert_eq!(idx.generation(), 2);
+
+        // Write-once: the first sealed segment's file is byte-identical.
+        assert_eq!(std::fs::read(&seg0).unwrap(), seg0_bytes, "seg-0 was rewritten");
+        // The new sealed segment was written.
+        assert!(dir.join("seg-00000002.tvim").exists());
+        // The superseded generation's hot snapshot + manifest were GC'd.
+        assert!(!dir.join("hot-00000001.tvim").exists());
+        assert!(!dir.join("MANIFEST-00000001").exists());
+        assert!(dir.join("MANIFEST-00000002").exists());
+
+        let reopened = SegmentedIndex::open(&dir).unwrap();
+        assert_eq!(reopened.len(), 120);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn durable_delete_survives_reopen() {
+        let dim = 64;
+        let n = 90;
+        let vecs = gen(n, dim, 21);
+        let ids: Vec<u64> = (0..n as u64).collect();
+        let mut idx = SegmentedIndex::new(dim, 4, 32).unwrap();
+        for cs in (0..n).step_by(20) {
+            let e = (cs + 20).min(n);
+            idx.add(&vecs[cs * dim..e * dim], &ids[cs..e]).unwrap();
+        }
+        assert!(idx.n_sealed() >= 1);
+        assert!(idx.remove(5)); // id 5 lives in a sealed segment
+
+        let dir = unique_tmp_dir("durable_del");
+        idx.save(&dir).unwrap();
+
+        let reopened = SegmentedIndex::open(&dir).unwrap();
+        assert_eq!(reopened.len(), n - 1);
+        assert!(!reopened.contains(5));
+        // The tombstone was re-applied: id 5 never resurfaces from the
+        // write-once segment file, even queried with its own vector.
+        let q5 = &vecs[5 * dim..6 * dim];
+        assert!(reopened.search(q5, 10).iter().all(|(id, _)| *id != 5));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn durable_atomic_commit_ignores_uncommitted_generation() {
+        let dim = 64;
+        let n = 80;
+        let vecs = gen(n, dim, 11);
+        let ids: Vec<u64> = (0..n as u64).collect();
+        let mut idx = SegmentedIndex::new(dim, 4, 32).unwrap();
+        for cs in (0..n).step_by(20) {
+            idx.add(&vecs[cs * dim..(cs + 20) * dim], &ids[cs..cs + 20]).unwrap();
+        }
+        let dir = unique_tmp_dir("durable_atomic");
+        idx.save(&dir).unwrap(); // commits generation 1
+
+        // Simulate a crash partway through the NEXT sync: new-generation files
+        // exist on disk, but CURRENT was never flipped to point at them.
+        std::fs::write(dir.join("MANIFEST-00000002"), b"{ not valid json").unwrap();
+        std::fs::write(dir.join("CURRENT.tmp"), b"MANIFEST-00000002").unwrap();
+        std::fs::write(dir.join("hot-00000002.tvim.tmp"), b"garbage").unwrap();
+
+        // open() must still load the last COMMITTED generation (1), ignoring
+        // the uncommitted generation-2 artifacts.
+        let reopened = SegmentedIndex::open(&dir).unwrap();
+        assert_eq!(reopened.generation(), 1);
+        assert_eq!(reopened.len(), idx.len());
+        let q = &vecs[7 * dim..8 * dim];
+        let a: Vec<u64> = idx.search(q, 5).iter().map(|(i, _)| *i).collect();
+        let b: Vec<u64> = reopened.search(q, 5).iter().map(|(i, _)| *i).collect();
+        assert_eq!(a, b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn durable_reopen_continues_incrementally() {
+        // Simulates two backends sharing one on-disk store: handle A creates
+        // and commits; handle B opens, appends, commits; handle C sees both.
+        let dim = 64;
+        let dir = unique_tmp_dir("durable_share");
+
+        {
+            let mut a = SegmentedIndex::new(dim, 4, 32).unwrap();
+            let v = gen(50, dim, 41);
+            let ids: Vec<u64> = (0..50).collect();
+            a.add(&v, &ids).unwrap();
+            a.save(&dir).unwrap();
+        }
+
+        let v2 = gen(30, dim, 42);
+        let ids2: Vec<u64> = (50..80).collect();
+        {
+            let mut b = SegmentedIndex::open(&dir).unwrap();
+            assert_eq!(b.len(), 50);
+            b.add(&v2, &ids2).unwrap();
+            b.sync().unwrap();
+        }
+
+        let c = SegmentedIndex::open(&dir).unwrap();
+        assert_eq!(c.len(), 80);
+        // A vector committed by the second handle is retrievable.
+        let q = &v2[0..dim];
+        assert!(c.search(q, 80).iter().any(|(id, _)| *id == 50));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

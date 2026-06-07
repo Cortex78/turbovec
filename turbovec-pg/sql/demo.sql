@@ -58,11 +58,15 @@ ORDER BY h.score DESC;
 -- ── Deletes & persistence ─────────────────────────────────────────────────────
 SELECT turbovec_delete('docs_idx', ctid) FROM docs WHERE id = 1;
 
--- Persist to disk (per-segment .tvim files + manifest.json) and reload. This
--- is how an index survives a backend restart in the PoC, since state is
--- per-backend in memory.
-SELECT turbovec_save('docs_idx', '/var/lib/postgresql/turbovec/docs_idx');
-SELECT turbovec_load('docs_idx', '/var/lib/postgresql/turbovec/docs_idx');
+-- Durable, crash-safe persistence. turbovec_save attaches the index to a
+-- directory and commits a generation; the commit is atomic (a single CURRENT
+-- rename) and incremental (sealed segments are write-once). turbovec_sync
+-- commits later changes cheaply; turbovec_load re-opens the last committed
+-- generation in any backend.
+SELECT turbovec_save('docs_idx', '/var/lib/postgresql/turbovec/docs_idx');  -- attach + commit
+-- ... more inserts / deletes ...
+SELECT turbovec_sync('docs_idx');                                           -- commit incrementally
+SELECT turbovec_load('docs_idx', '/var/lib/postgresql/turbovec/docs_idx');  -- re-open (e.g. another backend)
 
 -- ⚠ ctid stability: this PoC treats ctid as a stable handle. That holds for
 -- insert-/append-mostly corpora (typical for RAG), but UPDATE and
